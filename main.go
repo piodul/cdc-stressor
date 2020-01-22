@@ -16,7 +16,6 @@ import (
 
 var (
 	numConns     int
-	numWriters   int
 	numReaders   int
 	keyspaceName string
 	tableName    string
@@ -40,7 +39,6 @@ type Stream struct {
 
 func main() {
 	flag.IntVar(&numConns, "connections", 4, "number of connections")
-	flag.IntVar(&numWriters, "writers", 8, "number of writers")
 	flag.IntVar(&numReaders, "readers", 8, "number of readers")
 	flag.StringVar(&keyspaceName, "keyspace", "keyspace1", "keyspace name")
 	flag.StringVar(&tableName, "table", "standard1", "table name")
@@ -95,40 +93,6 @@ func main() {
 	st := &stats{}
 
 	wg := &sync.WaitGroup{}
-
-	wg.Add(numWriters)
-	for i := 0; i < numWriters; i++ {
-		go func() {
-			localStats := stats{}
-
-			defer wg.Done()
-			query := session.Query("INSERT INTO " + keyspaceName + "." + tableName + " (key, \"C0\") VALUES (?, ?)")
-
-			r := rand.New(rand.NewSource(rand.Int63()))
-
-			for atomic.LoadUint64(&stopper) == 0 {
-
-				key := make([]byte, 3)
-				value := make([]byte, rowSize)
-				_, _ = r.Read(key)
-				_, _ = r.Read(value)
-
-				bound := query.Bind(key, value)
-				start := time.Now()
-				err := bound.Exec()
-				end := time.Now()
-				if err != nil {
-					log.Printf("error: %s", err.Error())
-				}
-
-				localStats.rowsWritten++
-				localStats.cumulativeWriteDuration += uint64(end.Sub(start))
-			}
-
-			atomic.AddUint64(&st.rowsWritten, localStats.rowsWritten)
-			atomic.AddUint64(&st.cumulativeWriteDuration, localStats.cumulativeWriteDuration)
-		}()
-	}
 
 	wg.Add(numReaders)
 	for i := 0; i < numReaders; i++ {
