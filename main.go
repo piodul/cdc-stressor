@@ -3,34 +3,58 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/codahale/hdrhistogram"
 
 	"github.com/gocql/gocql"
 )
 
+const (
+	minBackoffTime time.Duration = 10 * time.Millisecond
+	maxBackoffTime time.Duration = 500 * time.Millisecond
+)
+
 var (
 	numConns     int
-	numReaders   int
 	keyspaceName string
 	tableName    string
 	cdcTableName string
+	timeout      time.Duration
 
-	testDuration int
+	testDuration time.Duration
 	endpoint     string
 	rowSize      int
 )
 
-type stats struct {
-	rowsWritten             uint64
-	readQueriesExecuted     uint64
-	cumulativeWriteDuration uint64
-	cumulativeReadDuration  uint64
+type Stats struct {
+	RequestLatency      *hdrhistogram.Histogram
+	LatencyToProcessRow *hdrhistogram.Histogram
+	RowsPerPoll         *hdrhistogram.Histogram
+
+	RowsRead  uint64
+	PollsDone uint64
+	IdlePolls uint64
+}
+
+func NewStats() *Stats {
+	return &Stats{
+		RequestLatency:      hdrhistogram.New(time.Microsecond.Nanoseconds()*50, (timeout + timeout*2).Nanoseconds(), 3),
+		LatencyToProcessRow: hdrhistogram.New(time.Microsecond.Nanoseconds()*50, (timeout + timeout*2).Nanoseconds(), 3),
+		RowsPerPoll:         hdrhistogram.New(0, 10000, 5),
+	}
+}
+
+func (stats *Stats) Merge(other *Stats) {
+	stats.RequestLatency.Merge(other.RequestLatency)
+	stats.LatencyToProcessRow.Merge(other.LatencyToProcessRow)
+	stats.RowsPerPoll.Merge(other.RowsPerPoll)
+	stats.RowsRead += other.RowsRead
+	stats.PollsDone += other.PollsDone
+	stats.IdlePolls += other.IdlePolls
 }
 
 type Stream struct {
@@ -39,12 +63,12 @@ type Stream struct {
 
 func main() {
 	flag.IntVar(&numConns, "connections", 4, "number of connections")
-	flag.IntVar(&numReaders, "readers", 8, "number of readers")
 	flag.StringVar(&keyspaceName, "keyspace", "keyspace1", "keyspace name")
 	flag.StringVar(&tableName, "table", "standard1", "table name")
-	flag.IntVar(&testDuration, "duration", 10, "test duration, in seconds")
+	flag.DurationVar(&testDuration, "duration", 10*time.Second, "test duration")
 	flag.StringVar(&endpoint, "endpoint", "127.0.0.1", "endpoint")
 	flag.IntVar(&rowSize, "row", 200, "size of the row data to be written")
+	flag.DurationVar(&timeout, "timeout", 5*time.Second, "request timeout")
 
 	flag.Parse()
 
@@ -55,92 +79,184 @@ func main() {
 	cluster.PageSize = 1024
 	cluster.Consistency = gocql.Quorum
 	cluster.Compressor = &gocql.SnappyCompressor{}
-	cluster.PoolConfig.HostSelectionPolicy = gocql.RoundRobinHostPolicy()
-	cluster.Timeout = 3 * time.Second
+	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
+	cluster.Timeout = timeout
 
 	session, err := cluster.CreateSession()
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	defer session.Close()
 
-	stopper := uint64(0)
+	stopC := make(chan struct{})
+
+	o := &sync.Once{}
+	cancel := func() {
+		o.Do(func() { close(stopC) })
+	}
 
 	interrupted := make(chan os.Signal, 1)
 	signal.Notify(interrupted, os.Interrupt)
 	go func() {
 		<-interrupted
 		fmt.Println("\ninterrupted")
-		atomic.StoreUint64(&stopper, 1)
+		cancel()
 
 		<-interrupted
 		fmt.Println("\nkilled")
 		os.Exit(1)
 	}()
 
-	// Get current streams
-	iter := session.Query("SELECT * FROM system_distributed.cdc_description").Iter()
-	var timestamp time.Time
-	var expired time.Time
-	var streams []Stream
+	statsC := ReadCdcLog(stopC, session, keyspaceName+"."+tableName)
+
+	select {
+	case <-time.After(testDuration):
+	case <-stopC:
+	}
+
+	cancel()
+
+	stats := <-statsC
+	fmt.Printf("num rows read: %d\n", stats.RowsRead)
+	fmt.Printf("rows read/s: %f/s\n", float64(stats.RowsRead)/testDuration.Seconds())
+	fmt.Printf("polls/s: %f/s\n", float64(stats.PollsDone)/testDuration.Seconds())
+	fmt.Printf("idle polls: %d/%d (%f%%)\n", stats.IdlePolls, stats.PollsDone, 100.0*float64(stats.IdlePolls)/float64(stats.PollsDone))
+	fmt.Println()
+	fmt.Println("Request latency:")
+	printStatsFor(stats.RequestLatency)
+	fmt.Println()
+	fmt.Println("Rows processed per poll:")
+	fmt.Printf("  min:    %d rows\n", stats.RowsPerPoll.Min())
+	fmt.Printf("  avg:    %f rows\n", stats.RowsPerPoll.Mean())
+	fmt.Printf("  median: %d rows\n", stats.RowsPerPoll.ValueAtQuantile(50.0))
+	fmt.Printf("  90%%:    %d rows\n", stats.RowsPerPoll.ValueAtQuantile(90.0))
+	fmt.Printf("  99%%:    %d rows\n", stats.RowsPerPoll.ValueAtQuantile(99.0))
+	fmt.Printf("  99.9%%:  %d rows\n", stats.RowsPerPoll.ValueAtQuantile(99.9))
+	fmt.Printf("  max:    %d rows\n", stats.RowsPerPoll.Max())
+	fmt.Println()
+	fmt.Println("Row processing latency (diff between row processing time and its timestamp)")
+	printStatsFor(stats.LatencyToProcessRow)
+	fmt.Println()
+}
+
+func printStatsFor(h *hdrhistogram.Histogram) {
+	fmt.Printf("  min:    %f ms\n", float64(h.Min())/1000000.0)
+	fmt.Printf("  avg:    %f ms\n", h.Mean()/1000000.0)
+	fmt.Printf("  median: %f ms\n", float64(h.ValueAtQuantile(50.0))/1000000.0)
+	fmt.Printf("  90%%:    %f ms\n", float64(h.ValueAtQuantile(90.0))/1000000.0)
+	fmt.Printf("  99%%:    %f ms\n", float64(h.ValueAtQuantile(99.0))/1000000.0)
+	fmt.Printf("  99.9%%:  %f ms\n", float64(h.ValueAtQuantile(99.9))/1000000.0)
+	fmt.Printf("  max:    %f ms\n", float64(h.Max())/1000000.0)
+}
+
+// TODO: For now, it only reads the last stream set, and does not react to changes to that stream
+func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, tableName string) <-chan *Stats {
+	startTimestamp := time.Now()
+	cdcLogTableName := tableName + "_scylla_cdc_log"
+
+	// Find the last stream set
+	iter := session.Query("SELECT time, expired, streams FROM system_distributed.cdc_description BYPASS CACHE").Iter()
+
+	var timestamp, bestTimestamp, expired time.Time
+	var streams, bestStreams []Stream
+
 	for iter.Scan(&timestamp, &expired, &streams) {
-		// fmt.Printf("streams: %#v\n", streams)
+		if bestTimestamp.Before(timestamp) {
+			bestTimestamp = timestamp
+			bestStreams = streams
+		}
 	}
+
+	// There should be at least one stream present...
 	if err := iter.Close(); err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
-	st := &stats{}
+	ret := make(chan *Stats)
 
-	wg := &sync.WaitGroup{}
+	joinChans := make([]<-chan *Stats, 0)
+	for _, stream := range bestStreams {
+		c := processStream(stop, session, stream, cdcLogTableName, startTimestamp)
+		joinChans = append(joinChans, c)
+	}
+	go func() {
+		stats := NewStats()
+		for _, c := range joinChans {
+			stats.Merge(<-c)
+		}
+		ret <- stats
+	}()
 
-	wg.Add(numReaders)
-	for i := 0; i < numReaders; i++ {
-		go func() {
-			localStats := stats{}
+	return ret
+}
 
-			defer wg.Done()
-			query := session.Query("SELECT \"_C0\" FROM " + keyspaceName + "." + cdcTableName +
-				" WHERE stream_id_1 = ? AND stream_id_2 = ? ORDER BY time DESC LIMIT 1")
+func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, cdcLogTableName string, timestamp time.Time) <-chan *Stats {
+	ret := make(chan *Stats)
+	go func() {
+		stats := NewStats()
+		defer func() { ret <- stats }()
 
-			r := rand.New(rand.NewSource(rand.Int63()))
+		lastTimestamp := gocql.MinTimeUUID(timestamp)
+		backoffTime := minBackoffTime
 
-			for atomic.LoadUint64(&stopper) == 0 {
-
-				// Choose random stream
-				n := r.Intn(len(streams))
-				stream := streams[n]
-
-				bound := query.Bind(stream.StreamID1, stream.StreamID2)
-				start := time.Now()
-				iter := bound.Iter()
-				var x, y int
-				var c0 []byte
-				for iter.Scan(&x, &c0, &y) {
-				}
-				if err := iter.Close(); err != nil {
-					log.Printf("error: %s", err.Error())
-				}
-				end := time.Now()
-
-				localStats.readQueriesExecuted++
-				localStats.cumulativeReadDuration += uint64(end.Sub(start))
+		for {
+			select {
+			case <-stop:
+				return
+			default:
 			}
 
-			atomic.AddUint64(&st.readQueriesExecuted, localStats.readQueriesExecuted)
-			atomic.AddUint64(&st.cumulativeReadDuration, localStats.cumulativeReadDuration)
-		}()
-	}
+			queryString := fmt.Sprintf("SELECT * FROM %s WHERE stream_id_1 = ? AND stream_id_2 = ? AND time > ? BYPASS CACHE", cdcLogTableName)
+			readStart := time.Now()
+			iter := session.Query(queryString).
+				Bind(stream.StreamID1, stream.StreamID2, lastTimestamp).
+				Iter()
 
-	<-time.After(time.Duration(testDuration) * time.Second)
-	atomic.StoreUint64(&stopper, 1)
-	wg.Wait()
+			rowCount := 0
+			timestamp := gocql.TimeUUID()
 
-	log.Printf("rows written: %d\n", st.rowsWritten)
-	log.Printf("rows per second: %f row/s\n", float64(st.rowsWritten)/float64(testDuration))
-	log.Printf("avg query time: %f ms\n", float64(st.cumulativeWriteDuration)/float64(st.rowsWritten)/float64(time.Millisecond))
+			for {
+				data := map[string]interface{}{
+					"time": &timestamp,
+				}
+				if !iter.MapScan(data) {
+					break
+				}
+				rowCount++
 
-	log.Printf("reads performed: %d\n", st.readQueriesExecuted)
-	log.Printf("reads per second: %f row/s\n", float64(st.readQueriesExecuted)/float64(testDuration))
-	log.Printf("avg query time: %f ms\n", float64(st.cumulativeReadDuration)/float64(st.readQueriesExecuted)/float64(time.Millisecond))
+				stats.RowsRead++
+				diff := time.Now().Sub(timestamp.Time()).Nanoseconds()
+				stats.LatencyToProcessRow.RecordValue(diff)
+				lastTimestamp = timestamp
+			}
+			readEnd := time.Now()
+
+			if err := iter.Close(); err != nil {
+				if err == gocql.ErrTimeoutNoResponse {
+					// Tough luck, let's try again later
+					continue
+				}
+				return
+			}
+
+			stats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
+			stats.RowsPerPoll.RecordValue(int64(rowCount))
+			stats.PollsDone++
+
+			if rowCount == 0 {
+				stats.IdlePolls++
+				select {
+				case <-time.After(backoffTime):
+					backoffTime *= 2
+					if backoffTime > maxBackoffTime {
+						backoffTime = maxBackoffTime
+					}
+				case <-stop:
+					return
+				}
+			}
+		}
+	}()
+
+	return ret
 }
