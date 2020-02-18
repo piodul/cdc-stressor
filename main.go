@@ -31,9 +31,7 @@ var (
 )
 
 type Stats struct {
-	RequestLatency      *hdrhistogram.Histogram
-	LatencyToProcessRow *hdrhistogram.Histogram
-	RowsPerPoll         *hdrhistogram.Histogram
+	RequestLatency *hdrhistogram.Histogram
 
 	RowsRead  uint64
 	PollsDone uint64
@@ -42,16 +40,12 @@ type Stats struct {
 
 func NewStats() *Stats {
 	return &Stats{
-		RequestLatency:      hdrhistogram.New(time.Microsecond.Nanoseconds()*50, (timeout + timeout*2).Nanoseconds(), 3),
-		LatencyToProcessRow: hdrhistogram.New(time.Microsecond.Nanoseconds()*50, (timeout + timeout*2).Nanoseconds(), 3),
-		RowsPerPoll:         hdrhistogram.New(0, 10000, 5),
+		RequestLatency: hdrhistogram.New(time.Microsecond.Nanoseconds()*50, (timeout + timeout*2).Nanoseconds(), 3),
 	}
 }
 
 func (stats *Stats) Merge(other *Stats) {
 	stats.RequestLatency.Merge(other.RequestLatency)
-	stats.LatencyToProcessRow.Merge(other.LatencyToProcessRow)
-	stats.RowsPerPoll.Merge(other.RowsPerPoll)
 	stats.RowsRead += other.RowsRead
 	stats.PollsDone += other.PollsDone
 	stats.IdlePolls += other.IdlePolls
@@ -124,19 +118,6 @@ func main() {
 	fmt.Println()
 	fmt.Println("Request latency:")
 	printStatsFor(stats.RequestLatency)
-	fmt.Println()
-	fmt.Println("Rows processed per poll:")
-	fmt.Printf("  min:    %d rows\n", stats.RowsPerPoll.Min())
-	fmt.Printf("  avg:    %f rows\n", stats.RowsPerPoll.Mean())
-	fmt.Printf("  median: %d rows\n", stats.RowsPerPoll.ValueAtQuantile(50.0))
-	fmt.Printf("  90%%:    %d rows\n", stats.RowsPerPoll.ValueAtQuantile(90.0))
-	fmt.Printf("  99%%:    %d rows\n", stats.RowsPerPoll.ValueAtQuantile(99.0))
-	fmt.Printf("  99.9%%:  %d rows\n", stats.RowsPerPoll.ValueAtQuantile(99.9))
-	fmt.Printf("  max:    %d rows\n", stats.RowsPerPoll.Max())
-	fmt.Println()
-	fmt.Println("Row processing latency (diff between row processing time and its timestamp)")
-	printStatsFor(stats.LatencyToProcessRow)
-	fmt.Println()
 }
 
 func printStatsFor(h *hdrhistogram.Histogram) {
@@ -225,8 +206,6 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 				rowCount++
 
 				stats.RowsRead++
-				diff := time.Now().Sub(timestamp.Time()).Nanoseconds()
-				stats.LatencyToProcessRow.RecordValue(diff)
 				lastTimestamp = timestamp
 			}
 			readEnd := time.Now()
@@ -240,7 +219,6 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			}
 
 			stats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
-			stats.RowsPerPoll.RecordValue(int64(rowCount))
 			stats.PollsDone++
 
 			if rowCount == 0 {
