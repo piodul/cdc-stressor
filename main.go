@@ -204,7 +204,8 @@ func main() {
 }
 
 func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName string) <-chan *Stats {
-	startTimestamp := time.Now()
+	// Account for grace period, so that we won't poll unnecessarily in the beginning
+	startTimestamp := time.Now().Add(-gracePeriod)
 
 	// Choose the most recent generation
 	iter := session.Query("SELECT time, expired, streams FROM system_distributed.cdc_description BYPASS CACHE").Iter()
