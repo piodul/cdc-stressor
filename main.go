@@ -175,23 +175,18 @@ func main() {
 	cancel()
 
 	stats := <-statsC
-	fmt.Printf("num rows read: %d\n", stats.RowsRead)
-	fmt.Printf("rows read/s: %f/s\n", float64(stats.RowsRead)/testDuration.Seconds())
-	fmt.Printf("polls/s: %f/s\n", float64(stats.PollsDone)/testDuration.Seconds())
-	fmt.Printf("idle polls: %d/%d (%f%%)\n", stats.IdlePolls, stats.PollsDone, 100.0*float64(stats.IdlePolls)/float64(stats.PollsDone))
-	fmt.Println()
-	fmt.Println("Request latency:")
-	printStatsFor(stats.RequestLatency)
-}
-
-func printStatsFor(h *hdrhistogram.Histogram) {
-	fmt.Printf("  min:    %f ms\n", float64(h.Min())/1000000.0)
-	fmt.Printf("  avg:    %f ms\n", h.Mean()/1000000.0)
-	fmt.Printf("  median: %f ms\n", float64(h.ValueAtQuantile(50.0))/1000000.0)
-	fmt.Printf("  90%%:    %f ms\n", float64(h.ValueAtQuantile(90.0))/1000000.0)
-	fmt.Printf("  99%%:    %f ms\n", float64(h.ValueAtQuantile(99.0))/1000000.0)
-	fmt.Printf("  99.9%%:  %f ms\n", float64(h.ValueAtQuantile(99.9))/1000000.0)
-	fmt.Printf("  max:    %f ms\n", float64(h.Max())/1000000.0)
+	fmt.Println("Results:")
+	fmt.Printf("num rows read:  %d\n", stats.RowsRead)
+	fmt.Printf("rows read/s:    %f/s\n", float64(stats.RowsRead)/testDuration.Seconds())
+	fmt.Printf("polls/s:        %f/s\n", float64(stats.PollsDone)/testDuration.Seconds())
+	fmt.Printf("idle polls:     %d/%d (%f%%)\n", stats.IdlePolls, stats.PollsDone, 100.0*float64(stats.IdlePolls)/float64(stats.PollsDone))
+	fmt.Printf("latency min:    %f ms\n", float64(stats.RequestLatency.Min())/1000000.0)
+	fmt.Printf("latency avg:    %f ms\n", stats.RequestLatency.Mean()/1000000.0)
+	fmt.Printf("latency median: %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(50.0))/1000000.0)
+	fmt.Printf("latency 90%%:    %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(90.0))/1000000.0)
+	fmt.Printf("latency 99%%:    %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(99.0))/1000000.0)
+	fmt.Printf("latency 99.9%%:  %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(99.9))/1000000.0)
+	fmt.Printf("latency max:    %f ms\n", float64(stats.RequestLatency.Max())/1000000.0)
 }
 
 func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName string) <-chan *Stats {
