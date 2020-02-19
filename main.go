@@ -35,6 +35,14 @@ var (
 	backoffMinimum    time.Duration
 	backoffMaximum    time.Duration
 	backoffMultiplier float64
+
+	// If client timestamps are used, it might result in rows with older timestamps
+	// than the last row to be inserted into a stream. If we just polled for rows
+	// newer than the timestamp of the last received rows, it would cause some rows
+	// to be missed.
+	// This option helps to mitigate that issue by querying for rows that are
+	// older than (now - `gracePeriod`) timestamp.`
+	gracePeriod time.Duration
 )
 
 type Stats struct {
@@ -77,6 +85,8 @@ func main() {
 	flag.DurationVar(&backoffMinimum, "backoff-min", 10*time.Millisecond, "minimum time to wait on backoff")
 	flag.DurationVar(&backoffMaximum, "backoff-max", 500*time.Millisecond, "maximum time to wait on backoff")
 	flag.Float64Var(&backoffMultiplier, "backoff-multiplier", 2.0, "multiplier that increases the wait time for consecutive backoffs (must be > 1)")
+
+	flag.DurationVar(&gracePeriod, "grace-period", 100*time.Millisecond, "queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps")
 
 	flag.Parse()
 
@@ -241,7 +251,7 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			bypassString = " BYPASS CACHE"
 		}
 		queryString := fmt.Sprintf(
-			"SELECT * FROM %s WHERE stream_id_1 = %d AND stream_id_2 = %d AND time > ?%s",
+			"SELECT * FROM %s WHERE stream_id_1 = %d AND stream_id_2 = %d AND time > ? AND time < ?%s",
 			cdcLogTableName, stream.StreamID1, stream.StreamID2, bypassString,
 		)
 		query := session.Query(queryString)
@@ -254,7 +264,7 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			}
 
 			readStart := time.Now()
-			iter := query.Bind(lastTimestamp).Iter()
+			iter := query.Bind(lastTimestamp, gocql.MinTimeUUID(time.Now().Add(-gracePeriod))).Iter()
 
 			rowCount := 0
 			timestamp := gocql.TimeUUID()
