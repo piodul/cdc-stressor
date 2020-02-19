@@ -43,6 +43,9 @@ var (
 	// This option helps to mitigate that issue by querying for rows that are
 	// older than (now - `gracePeriod`) timestamp.`
 	gracePeriod time.Duration
+
+	workerID    int
+	workerCount int
 )
 
 type Stats struct {
@@ -88,6 +91,9 @@ func main() {
 
 	flag.DurationVar(&gracePeriod, "grace-period", 100*time.Millisecond, "queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps")
 
+	flag.IntVar(&workerID, "worker-id", 0, "id of this worker, used when running multiple instances of this tool; each instance should have a different id, and it must be in range [0..N-1], where N is the number of workers")
+	flag.IntVar(&workerCount, "worker-count", 1, "number of workers reading from the same table")
+
 	flag.Parse()
 
 	if !strings.HasSuffix(tableName, cdcTableSuffix) {
@@ -100,6 +106,14 @@ func main() {
 
 	if backoffMultiplier <= 1.0 {
 		log.Fatal("backoff multiplier must be greater than 1")
+	}
+
+	if workerCount < 1 {
+		log.Fatal("worker count must be larger than 0")
+	}
+
+	if workerID < 0 || workerID >= workerCount {
+		log.Fatal("worker id must be from range [0..N-1], where N is the number of workers")
 	}
 
 	cluster := gocql.NewCluster(strings.Split(nodes, ",")...)
@@ -216,10 +230,12 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 	ret := make(chan *Stats)
 
 	joinChans := make([]<-chan *Stats, 0)
-	for _, stream := range bestStreams {
+	for i := workerID; i < len(bestStreams); i += workerCount {
+		stream := bestStreams[i]
 		c := processStream(stop, session, stream, cdcLogTableName, startTimestamp)
 		joinChans = append(joinChans, c)
 	}
+	log.Printf("Watching changes from %d of %d total streams", len(joinChans), len(bestStreams))
 	go func() {
 		stats := NewStats()
 		for _, c := range joinChans {
