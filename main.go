@@ -3,8 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,20 +16,25 @@ import (
 )
 
 const (
-	minBackoffTime time.Duration = 10 * time.Millisecond
-	maxBackoffTime time.Duration = 500 * time.Millisecond
+	cdcTableSuffix string = "_scylla_cdc_log"
 )
 
 var (
 	numConns     int
 	keyspaceName string
 	tableName    string
-	cdcTableName string
 	timeout      time.Duration
 
-	testDuration time.Duration
-	endpoint     string
-	rowSize      int
+	testDuration      time.Duration
+	nodes             string
+	pageSize          int
+	consistencyLevel  string
+	clientCompression bool
+	bypassCache       bool
+
+	backoffMinimum    time.Duration
+	backoffMaximum    time.Duration
+	backoffMultiplier float64
 )
 
 type Stats struct {
@@ -56,29 +63,71 @@ type Stream struct {
 }
 
 func main() {
-	flag.IntVar(&numConns, "connections", 4, "number of connections")
-	flag.StringVar(&keyspaceName, "keyspace", "keyspace1", "keyspace name")
-	flag.StringVar(&tableName, "table", "standard1", "table name")
-	flag.DurationVar(&testDuration, "duration", 10*time.Second, "test duration")
-	flag.StringVar(&endpoint, "endpoint", "127.0.0.1", "endpoint")
-	flag.IntVar(&rowSize, "row", 200, "size of the row data to be written")
+	flag.IntVar(&numConns, "connection-count", 4, "number of connections")
+	flag.StringVar(&keyspaceName, "keyspace", "scylla_bench", "keyspace name")
+	flag.StringVar(&tableName, "table", "test"+cdcTableSuffix, "name of the cdc table to read from")
+	flag.DurationVar(&testDuration, "duration", 0, "test duration, value <= 0 makes the test run infinitely until stopped")
+	flag.StringVar(&nodes, "nodes", "127.0.0.1", "cluster nodes to connect to")
+	flag.IntVar(&pageSize, "page-size", 1000, "page size")
 	flag.DurationVar(&timeout, "timeout", 5*time.Second, "request timeout")
+	flag.StringVar(&consistencyLevel, "consistency-level", "quorum", "consistency level to use when reading")
+	flag.BoolVar(&clientCompression, "client-compression", true, "use compression for client-coordinator communication")
+	flag.BoolVar(&bypassCache, "bypass-cache", true, "use BYPASS CACHE when querying the cdc log table")
+
+	flag.DurationVar(&backoffMinimum, "backoff-min", 10*time.Millisecond, "minimum time to wait on backoff")
+	flag.DurationVar(&backoffMaximum, "backoff-max", 500*time.Millisecond, "maximum time to wait on backoff")
+	flag.Float64Var(&backoffMultiplier, "backoff-multiplier", 2.0, "multiplier that increases the wait time for consecutive backoffs (must be > 1)")
 
 	flag.Parse()
 
-	cdcTableName = tableName + "_scylla_cdc_log"
+	if !strings.HasSuffix(tableName, cdcTableSuffix) {
+		log.Fatalf("table name should have %s suffix", cdcTableSuffix)
+	}
 
-	cluster := gocql.NewCluster(endpoint)
+	if backoffMinimum > backoffMaximum {
+		log.Fatal("minimum backoff time must not be larget than maximum backoff time")
+	}
+
+	if backoffMultiplier <= 1.0 {
+		log.Fatal("backoff multiplier must be greater than 1")
+	}
+
+	cluster := gocql.NewCluster(strings.Split(nodes, ",")...)
 	cluster.NumConns = numConns
-	cluster.PageSize = 1024
-	cluster.Consistency = gocql.Quorum
+	cluster.PageSize = pageSize
 	cluster.Compressor = &gocql.SnappyCompressor{}
 	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
 	cluster.Timeout = timeout
 
+	switch consistencyLevel {
+	case "any":
+		cluster.Consistency = gocql.Any
+	case "one":
+		cluster.Consistency = gocql.One
+	case "two":
+		cluster.Consistency = gocql.Two
+	case "three":
+		cluster.Consistency = gocql.Three
+	case "quorum":
+		cluster.Consistency = gocql.Quorum
+	case "all":
+		cluster.Consistency = gocql.All
+	case "local_quorum":
+		cluster.Consistency = gocql.LocalQuorum
+	case "each_quorum":
+		cluster.Consistency = gocql.EachQuorum
+	case "local_one":
+		cluster.Consistency = gocql.LocalOne
+	default:
+		log.Fatalf("unknown consistency level: %s", consistencyLevel)
+	}
+	if clientCompression {
+		cluster.Compressor = &gocql.SnappyCompressor{}
+	}
+
 	session, err := cluster.CreateSession()
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	defer session.Close()
 
@@ -93,18 +142,23 @@ func main() {
 	signal.Notify(interrupted, os.Interrupt)
 	go func() {
 		<-interrupted
-		fmt.Println("\ninterrupted")
+		log.Println("interrupted")
 		cancel()
 
 		<-interrupted
-		fmt.Println("\nkilled")
+		log.Println("killed")
 		os.Exit(1)
 	}()
 
 	statsC := ReadCdcLog(stopC, session, keyspaceName+"."+tableName)
 
+	var timeoutC <-chan time.Time
+	if testDuration > 0 {
+		timeoutC = time.After(testDuration)
+	}
+
 	select {
-	case <-time.After(testDuration):
+	case <-timeoutC:
 	case <-stopC:
 	}
 
@@ -130,12 +184,10 @@ func printStatsFor(h *hdrhistogram.Histogram) {
 	fmt.Printf("  max:    %f ms\n", float64(h.Max())/1000000.0)
 }
 
-// TODO: For now, it only reads the last stream set, and does not react to changes to that stream
-func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, tableName string) <-chan *Stats {
+func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName string) <-chan *Stats {
 	startTimestamp := time.Now()
-	cdcLogTableName := tableName + "_scylla_cdc_log"
 
-	// Find the last stream set
+	// Choose the most recent generation
 	iter := session.Query("SELECT time, expired, streams FROM system_distributed.cdc_description BYPASS CACHE").Iter()
 
 	var timestamp, bestTimestamp, expired time.Time
@@ -148,9 +200,12 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, tableName string) 
 		}
 	}
 
-	// There should be at least one stream present...
 	if err := iter.Close(); err != nil {
-		panic(err)
+		log.Fatal(err)
+	}
+
+	if len(bestStreams) == 0 {
+		log.Fatal("There are no streams in the most recent generation, or there are no generations in cdc_description table")
 	}
 
 	ret := make(chan *Stats)
@@ -173,12 +228,23 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, tableName string) 
 
 func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, cdcLogTableName string, timestamp time.Time) <-chan *Stats {
 	ret := make(chan *Stats)
+
 	go func() {
 		stats := NewStats()
 		defer func() { ret <- stats }()
 
 		lastTimestamp := gocql.MinTimeUUID(timestamp)
-		backoffTime := minBackoffTime
+		backoffTime := backoffMinimum
+
+		bypassString := ""
+		if bypassCache {
+			bypassString = " BYPASS CACHE"
+		}
+		queryString := fmt.Sprintf(
+			"SELECT * FROM %s WHERE stream_id_1 = %d AND stream_id_2 = %d AND time > ?%s",
+			cdcLogTableName, stream.StreamID1, stream.StreamID2, bypassString,
+		)
+		query := session.Query(queryString)
 
 		for {
 			select {
@@ -187,11 +253,8 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			default:
 			}
 
-			queryString := fmt.Sprintf("SELECT * FROM %s WHERE stream_id_1 = ? AND stream_id_2 = ? AND time > ? BYPASS CACHE", cdcLogTableName)
 			readStart := time.Now()
-			iter := session.Query(queryString).
-				Bind(stream.StreamID1, stream.StreamID2, lastTimestamp).
-				Iter()
+			iter := query.Bind(lastTimestamp).Iter()
 
 			rowCount := 0
 			timestamp := gocql.TimeUUID()
@@ -211,27 +274,26 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			readEnd := time.Now()
 
 			if err := iter.Close(); err != nil {
-				if err == gocql.ErrTimeoutNoResponse {
-					// Tough luck, let's try again later
-					continue
-				}
-				return
+				// Log error and continue to backoff logic
+				log.Println(err)
+			} else {
+				stats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
 			}
-
-			stats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
 			stats.PollsDone++
 
 			if rowCount == 0 {
 				stats.IdlePolls++
 				select {
 				case <-time.After(backoffTime):
-					backoffTime *= 2
-					if backoffTime > maxBackoffTime {
-						backoffTime = maxBackoffTime
+					backoffTime *= time.Duration(float64(backoffTime) * backoffMultiplier)
+					if backoffTime > backoffMaximum {
+						backoffTime = backoffMaximum
 					}
 				case <-stop:
 					return
 				}
+			} else {
+				backoffTime = backoffMinimum
 			}
 		}
 	}()
