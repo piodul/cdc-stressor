@@ -263,8 +263,8 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			bypassString = " BYPASS CACHE"
 		}
 		queryString := fmt.Sprintf(
-			"SELECT * FROM %s WHERE stream_id_1 = %d AND stream_id_2 = %d AND time > ? AND time < ?%s",
-			cdcLogTableName, stream.StreamID1, stream.StreamID2, bypassString,
+			"SELECT * FROM %s WHERE stream_id_1 = ? AND stream_id_2 = ? AND time > ? AND time < ?%s",
+			cdcLogTableName, bypassString,
 		)
 		query := session.Query(queryString)
 
@@ -276,7 +276,7 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			}
 
 			readStart := time.Now()
-			iter := query.Bind(lastTimestamp, gocql.MinTimeUUID(time.Now().Add(-gracePeriod))).Iter()
+			iter := query.Bind(stream.StreamID1, stream.StreamID2, lastTimestamp, gocql.MinTimeUUID(time.Now().Add(-gracePeriod))).Iter()
 
 			rowCount := 0
 			timestamp := gocql.TimeUUID()
