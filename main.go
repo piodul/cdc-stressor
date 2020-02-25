@@ -255,7 +255,7 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 		stats := NewStats()
 		defer func() { ret <- stats }()
 
-		lastTimestamp := gocql.MinTimeUUID(timestamp)
+		lastTimestamp := gocql.UUIDFromTime(timestamp)
 		backoffTime := backoffMinimum
 
 		bypassString := ""
@@ -276,7 +276,7 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			}
 
 			readStart := time.Now()
-			iter := query.Bind(stream.StreamID1, stream.StreamID2, lastTimestamp, gocql.MinTimeUUID(time.Now().Add(-gracePeriod))).Iter()
+			iter := query.Bind(stream.StreamID1, stream.StreamID2, lastTimestamp, gocql.UUIDFromTime(time.Now().Add(-gracePeriod))).Iter()
 
 			rowCount := 0
 			timestamp := gocql.TimeUUID()
