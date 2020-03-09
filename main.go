@@ -69,9 +69,7 @@ func (stats *Stats) Merge(other *Stats) {
 	stats.IdlePolls += other.IdlePolls
 }
 
-type Stream struct {
-	StreamID1, StreamID2 int64
-}
+type Stream []byte
 
 func main() {
 	flag.IntVar(&numConns, "connection-count", 4, "number of connections")
@@ -263,7 +261,7 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			bypassString = " BYPASS CACHE"
 		}
 		queryString := fmt.Sprintf(
-			"SELECT * FROM %s WHERE stream_id_1 = ? AND stream_id_2 = ? AND time > ? AND time < ?%s",
+			"SELECT * FROM %s WHERE \"cdc$stream_id\" = ? AND \"cdc$time\" > ? AND \"cdc$time\" < ?%s",
 			cdcLogTableName, bypassString,
 		)
 		query := session.Query(queryString)
@@ -276,14 +274,14 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			}
 
 			readStart := time.Now()
-			iter := query.Bind(stream.StreamID1, stream.StreamID2, lastTimestamp, gocql.UUIDFromTime(time.Now().Add(-gracePeriod))).Iter()
+			iter := query.Bind(stream, lastTimestamp, gocql.UUIDFromTime(time.Now().Add(-gracePeriod))).Iter()
 
 			rowCount := 0
 			timestamp := gocql.TimeUUID()
 
 			for {
 				data := map[string]interface{}{
-					"time": &timestamp,
+					"cdc$time": &timestamp,
 				}
 				if !iter.MapScan(data) {
 					break
