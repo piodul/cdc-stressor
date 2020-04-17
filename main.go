@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -43,6 +44,11 @@ var (
 	// This option helps to mitigate that issue by querying for rows that are
 	// older than (now - `gracePeriod`) timestamp.`
 	gracePeriod time.Duration
+
+	// After fetching at most processingBatchSize rows, processing of the rows
+	// will be simulated by sleeping for processingBatchSize * processingTimePerRow.
+	processingTimePerRow time.Duration
+	processingBatchSize  uint64
 
 	workerID    int
 	workerCount int
@@ -89,6 +95,9 @@ func main() {
 
 	flag.DurationVar(&gracePeriod, "grace-period", 100*time.Millisecond, "queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps")
 
+	flag.DurationVar(&processingTimePerRow, "processing-time-per-row", 10*time.Millisecond, "how much processing time one row adds to current batch")
+	flag.Uint64Var(&processingBatchSize, "processing-batch-size", 0, "maximum count of rows to process in one batch; after each batch the goroutine will sleep some time proportional to the number of rows in batch")
+
 	flag.IntVar(&workerID, "worker-id", 0, "id of this worker, used when running multiple instances of this tool; each instance should have a different id, and it must be in range [0..N-1], where N is the number of workers")
 	flag.IntVar(&workerCount, "worker-count", 1, "number of workers reading from the same table")
 
@@ -112,6 +121,10 @@ func main() {
 
 	if workerID < 0 || workerID >= workerCount {
 		log.Fatal("worker id must be from range [0..N-1], where N is the number of workers")
+	}
+
+	if processingBatchSize == 0 {
+		processingBatchSize = math.MaxInt64
 	}
 
 	cluster := gocql.NewCluster(strings.Split(nodes, ",")...)
@@ -277,20 +290,41 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			iter := query.Bind(stream, lastTimestamp, gocql.UUIDFromTime(time.Now().Add(-gracePeriod))).Iter()
 
 			rowCount := 0
+			batchRowCount := uint64(0)
 			timestamp := gocql.TimeUUID()
+
+			sleepForBatch := func() (doStop bool) {
+				sleepDuration := time.Duration(batchRowCount) * processingTimePerRow
+				batchRowCount = 0
+				select {
+				case <-stop:
+					return true
+				case <-time.After(sleepDuration):
+					return false
+				}
+			}
 
 			for {
 				data := map[string]interface{}{
 					"cdc$time": &timestamp,
 				}
 				if !iter.MapScan(data) {
+					sleepForBatch()
 					break
 				}
 				rowCount++
+				batchRowCount++
 
 				stats.RowsRead++
 				lastTimestamp = timestamp
+
+				if batchRowCount == processingBatchSize {
+					if doStop := sleepForBatch(); doStop {
+						break
+					}
+				}
 			}
+
 			readEnd := time.Now()
 
 			if err := iter.Close(); err != nil {
