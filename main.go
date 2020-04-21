@@ -62,6 +62,7 @@ type Stats struct {
 	RowsRead  uint64
 	PollsDone uint64
 	IdlePolls uint64
+	Errors    uint64
 }
 
 func NewStats() *Stats {
@@ -75,6 +76,7 @@ func (stats *Stats) Merge(other *Stats) {
 	stats.RowsRead += other.RowsRead
 	stats.PollsDone += other.PollsDone
 	stats.IdlePolls += other.IdlePolls
+	stats.Errors += other.Errors
 }
 
 type Stream []byte
@@ -209,6 +211,7 @@ func main() {
 	fmt.Printf("rows read/s:    %f/s\n", float64(stats.RowsRead)/testDuration.Seconds())
 	fmt.Printf("polls/s:        %f/s\n", float64(stats.PollsDone)/testDuration.Seconds())
 	fmt.Printf("idle polls:     %d/%d (%f%%)\n", stats.IdlePolls, stats.PollsDone, 100.0*float64(stats.IdlePolls)/float64(stats.PollsDone))
+	fmt.Printf("errors:         %d\n", stats.Errors)
 	fmt.Printf("latency min:    %f ms\n", float64(stats.RequestLatency.Min())/1000000.0)
 	fmt.Printf("latency avg:    %f ms\n", stats.RequestLatency.Mean()/1000000.0)
 	fmt.Printf("latency median: %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(50.0))/1000000.0)
@@ -336,6 +339,7 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 				if verbose {
 					log.Println(err)
 				}
+				stats.Errors++
 			} else {
 				stats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
 			}
