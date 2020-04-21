@@ -52,6 +52,8 @@ var (
 
 	workerID    int
 	workerCount int
+
+	verbose bool
 )
 
 type Stats struct {
@@ -100,6 +102,8 @@ func main() {
 
 	flag.IntVar(&workerID, "worker-id", 0, "id of this worker, used when running multiple instances of this tool; each instance should have a different id, and it must be in range [0..N-1], where N is the number of workers")
 	flag.IntVar(&workerCount, "worker-count", 1, "number of workers reading from the same table")
+
+	flag.BoolVar(&verbose, "verbose", false, "enables printing error message each time a read operation on cdc log table fails")
 
 	flag.Parse()
 
@@ -329,7 +333,9 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 
 			if err := iter.Close(); err != nil {
 				// Log error and continue to backoff logic
-				log.Println(err)
+				if verbose {
+					log.Println(err)
+				}
 			} else {
 				stats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
 			}
