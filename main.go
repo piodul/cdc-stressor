@@ -206,6 +206,10 @@ func main() {
 	cancel()
 
 	stats := <-statsC
+	printFinalResults(stats)
+}
+
+func printFinalResults(stats *Stats) {
 	fmt.Println("Results:")
 	fmt.Printf("num rows read:  %d\n", stats.RowsRead)
 	fmt.Printf("rows read/s:    %f/s\n", float64(stats.RowsRead)/testDuration.Seconds())
