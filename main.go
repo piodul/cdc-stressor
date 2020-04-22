@@ -191,7 +191,7 @@ func main() {
 		os.Exit(1)
 	}()
 
-	statsC := ReadCdcLog(stopC, session, keyspaceName+"."+tableName)
+	finished := ReadCdcLog(stopC, session, keyspaceName+"."+tableName)
 
 	var timeoutC <-chan time.Time
 	if testDuration > 0 {
@@ -205,8 +205,7 @@ func main() {
 
 	cancel()
 
-	stats := <-statsC
-	printFinalResults(stats)
+	<-finished
 }
 
 func printFinalResults(stats *Stats) {
@@ -225,7 +224,7 @@ func printFinalResults(stats *Stats) {
 	fmt.Printf("latency max:    %f ms\n", float64(stats.RequestLatency.Max())/1000000.0)
 }
 
-func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName string) <-chan *Stats {
+func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName string) <-chan struct{} {
 	// Account for grace period, so that we won't poll unnecessarily in the beginning
 	startTimestamp := time.Now().Add(-gracePeriod)
 
@@ -250,7 +249,7 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 		log.Fatal("There are no streams in the most recent generation, or there are no generations in cdc_description table")
 	}
 
-	ret := make(chan *Stats)
+	ret := make(chan struct{})
 
 	joinChans := make([]<-chan *Stats, 0)
 	for i := workerID; i < len(bestStreams); i += workerCount {
@@ -264,7 +263,8 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 		for _, c := range joinChans {
 			stats.Merge(<-c)
 		}
-		ret <- stats
+		printFinalResults(stats)
+		close(ret)
 	}()
 
 	return ret
