@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -55,7 +56,8 @@ var (
 	workerID    int
 	workerCount int
 
-	verbose bool
+	verbose                bool
+	printPollSizeHistogram bool
 )
 
 type Stats struct {
@@ -67,13 +69,21 @@ type Stats struct {
 	IdlePolls   uint64
 	Errors      uint64
 
+	PollSizeDistribution map[int]int
+
 	Final bool
 }
 
 func NewStats() *Stats {
-	return &Stats{
+	stats := &Stats{
 		RequestLatency: hdrhistogram.New(time.Microsecond.Nanoseconds()*50, (timeout + timeout*2).Nanoseconds(), 3),
 	}
+
+	if printPollSizeHistogram {
+		stats.PollSizeDistribution = make(map[int]int)
+	}
+
+	return stats
 }
 
 func (stats *Stats) Merge(other *Stats) {
@@ -85,6 +95,12 @@ func (stats *Stats) Merge(other *Stats) {
 	stats.PollsDone += other.PollsDone
 	stats.IdlePolls += other.IdlePolls
 	stats.Errors += other.Errors
+
+	if printPollSizeHistogram {
+		for pollSize, count := range other.PollSizeDistribution {
+			stats.PollSizeDistribution[pollSize] += count
+		}
+	}
 }
 
 type Stream []byte
@@ -115,6 +131,7 @@ func main() {
 
 	flag.DurationVar(&logInterval, "log-interval", time.Second, "how much time to wait between printing partial results")
 	flag.BoolVar(&verbose, "verbose", false, "enables printing error message each time a read operation on cdc log table fails")
+	flag.BoolVar(&printPollSizeHistogram, "print-poll-size-histogram", true, "enables printing poll size histogram at the end")
 
 	flag.Parse()
 
@@ -239,6 +256,20 @@ func printFinalResults(stats *Stats) {
 	fmt.Printf("latency 99%%:    %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(99.0))/1000000.0)
 	fmt.Printf("latency 99.9%%:  %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(99.9))/1000000.0)
 	fmt.Printf("latency max:    %f ms\n", float64(stats.RequestLatency.Max())/1000000.0)
+
+	if printPollSizeHistogram {
+		pollSizes := make([]int, 0, len(stats.PollSizeDistribution))
+		for pollSize := range stats.PollSizeDistribution {
+			pollSizes = append(pollSizes, pollSize)
+		}
+		sort.Ints(pollSizes)
+
+		fmt.Println("poll size distribution:")
+		fmt.Println("  size   :   count")
+		for _, pollSize := range pollSizes {
+			fmt.Printf("  %-7d: %7d\n", pollSize, stats.PollSizeDistribution[pollSize])
+		}
+	}
 }
 
 func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName string) <-chan struct{} {
@@ -411,6 +442,9 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 				currentStats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
 			}
 			currentStats.PollsDone++
+			if printPollSizeHistogram {
+				currentStats.PollSizeDistribution[rowCount]++
+			}
 
 			if rowCount == 0 {
 				currentStats.IdlePolls++
