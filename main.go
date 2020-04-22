@@ -50,6 +50,8 @@ var (
 	processingTimePerRow time.Duration
 	processingBatchSize  uint64
 
+	logInterval time.Duration
+
 	workerID    int
 	workerCount int
 
@@ -59,10 +61,13 @@ var (
 type Stats struct {
 	RequestLatency *hdrhistogram.Histogram
 
-	RowsRead  uint64
-	PollsDone uint64
-	IdlePolls uint64
-	Errors    uint64
+	TimeElapsed time.Duration
+	RowsRead    uint64
+	PollsDone   uint64
+	IdlePolls   uint64
+	Errors      uint64
+
+	Final bool
 }
 
 func NewStats() *Stats {
@@ -72,6 +77,9 @@ func NewStats() *Stats {
 }
 
 func (stats *Stats) Merge(other *Stats) {
+	if stats.TimeElapsed < other.TimeElapsed {
+		stats.TimeElapsed = other.TimeElapsed
+	}
 	stats.RequestLatency.Merge(other.RequestLatency)
 	stats.RowsRead += other.RowsRead
 	stats.PollsDone += other.PollsDone
@@ -105,6 +113,7 @@ func main() {
 	flag.IntVar(&workerID, "worker-id", 0, "id of this worker, used when running multiple instances of this tool; each instance should have a different id, and it must be in range [0..N-1], where N is the number of workers")
 	flag.IntVar(&workerCount, "worker-count", 1, "number of workers reading from the same table")
 
+	flag.DurationVar(&logInterval, "log-interval", time.Second, "how much time to wait between printing partial results")
 	flag.BoolVar(&verbose, "verbose", false, "enables printing error message each time a read operation on cdc log table fails")
 
 	flag.Parse()
@@ -208,6 +217,14 @@ func main() {
 	<-finished
 }
 
+func printPartialResults(stats *Stats, normalizationFactor float64) {
+	fmtString := "%-15v  %15v  %7v    %7v\n"
+	normalized := func(i uint64) uint64 {
+		return uint64(math.Ceil(float64(i) * normalizationFactor))
+	}
+	fmt.Printf(fmtString, stats.TimeElapsed, normalized(stats.PollsDone), normalized(stats.RowsRead), normalized(stats.Errors))
+}
+
 func printFinalResults(stats *Stats) {
 	fmt.Println("Results:")
 	fmt.Printf("num rows read:  %d\n", stats.RowsRead)
@@ -249,33 +266,79 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 		log.Fatal("There are no streams in the most recent generation, or there are no generations in cdc_description table")
 	}
 
-	ret := make(chan struct{})
+	finished := make(chan struct{})
 
-	joinChans := make([]<-chan *Stats, 0)
+	statsChans := make([]<-chan *Stats, 0)
 	for i := workerID; i < len(bestStreams); i += workerCount {
 		stream := bestStreams[i]
 		c := processStream(stop, session, stream, cdcLogTableName, startTimestamp)
-		joinChans = append(joinChans, c)
+		statsChans = append(statsChans, c)
 	}
-	log.Printf("Watching changes from %d of %d total streams", len(joinChans), len(bestStreams))
+	log.Printf("Watching changes from %d of %d total streams", len(statsChans), len(bestStreams))
+	fmt.Println("Time elapsed             Polls/s   Rows/s   Errors/s")
+
 	go func() {
-		stats := NewStats()
-		for _, c := range joinChans {
-			stats.Merge(<-c)
+		previousTimeElapsed := time.Duration(0)
+		for {
+			final, stats := mergeStats(statsChans)
+			if final {
+				printFinalResults(stats)
+				finished <- struct{}{}
+				return
+			} else {
+				normalizationFactor := float64(time.Second) / float64(stats.TimeElapsed-previousTimeElapsed)
+				printPartialResults(stats, normalizationFactor)
+				previousTimeElapsed = stats.TimeElapsed
+				continue
+			}
 		}
-		printFinalResults(stats)
-		close(ret)
 	}()
 
-	return ret
+	return finished
+}
+
+func mergeStats(statsChans []<-chan *Stats) (final bool, result *Stats) {
+	result = NewStats()
+	for i, ch := range statsChans {
+		streamStats := <-ch
+		if streamStats.Final {
+			result = streamStats
+			result = mergeFinalStats(result, statsChans[:i])
+			result = mergeFinalStats(result, statsChans[i+1:])
+			return true, result
+		}
+
+		result.Merge(streamStats)
+	}
+
+	return false, result
+}
+
+func mergeFinalStats(result *Stats, statsChans []<-chan *Stats) *Stats {
+	for _, ch := range statsChans {
+		streamStats := <-ch
+		for !streamStats.Final {
+			streamStats = <-ch
+		}
+		result.Merge(streamStats)
+	}
+	return result
 }
 
 func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, cdcLogTableName string, timestamp time.Time) <-chan *Stats {
-	ret := make(chan *Stats)
+	statsChan := make(chan *Stats, 1)
 
 	go func() {
-		stats := NewStats()
-		defer func() { ret <- stats }()
+		processStartTime := time.Now()
+		nextReportTime := processStartTime.Add(logInterval)
+
+		finalStats := NewStats()
+		finalStats.Final = true
+		currentStats := NewStats()
+		defer func() {
+			finalStats.Merge(currentStats)
+			statsChan <- finalStats
+		}()
 
 		lastTimestamp := gocql.UUIDFromTime(timestamp)
 		backoffTime := backoffMinimum
@@ -326,7 +389,7 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 				rowCount++
 				batchRowCount++
 
-				stats.RowsRead++
+				currentStats.RowsRead++
 				lastTimestamp = timestamp
 
 				if batchRowCount == processingBatchSize {
@@ -343,14 +406,14 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 				if verbose {
 					log.Println(err)
 				}
-				stats.Errors++
+				currentStats.Errors++
 			} else {
-				stats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
+				currentStats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
 			}
-			stats.PollsDone++
+			currentStats.PollsDone++
 
 			if rowCount == 0 {
-				stats.IdlePolls++
+				currentStats.IdlePolls++
 				select {
 				case <-time.After(backoffTime):
 					backoffTime *= time.Duration(float64(backoffTime) * backoffMultiplier)
@@ -363,8 +426,18 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			} else {
 				backoffTime = backoffMinimum
 			}
+
+			now := time.Now()
+			if now.After(nextReportTime) {
+				currentStats.TimeElapsed = now.Sub(processStartTime)
+				finalStats.Merge(currentStats)
+				statsChan <- currentStats
+
+				currentStats = NewStats()
+				nextReportTime = nextReportTime.Add(logInterval)
+			}
 		}
 	}()
 
-	return ret
+	return statsChan
 }
