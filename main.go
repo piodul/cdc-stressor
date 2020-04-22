@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/codahale/hdrhistogram"
-
 	"github.com/gocql/gocql"
 )
 
@@ -61,8 +59,6 @@ var (
 )
 
 type Stats struct {
-	RequestLatency *hdrhistogram.Histogram
-
 	TimeElapsed time.Duration
 	RowsRead    uint64
 	PollsDone   uint64
@@ -75,9 +71,7 @@ type Stats struct {
 }
 
 func NewStats() *Stats {
-	stats := &Stats{
-		RequestLatency: hdrhistogram.New(time.Microsecond.Nanoseconds()*50, (timeout + timeout*2).Nanoseconds(), 3),
-	}
+	stats := &Stats{}
 
 	if printPollSizeHistogram {
 		stats.PollSizeDistribution = make(map[int]int)
@@ -90,7 +84,6 @@ func (stats *Stats) Merge(other *Stats) {
 	if stats.TimeElapsed < other.TimeElapsed {
 		stats.TimeElapsed = other.TimeElapsed
 	}
-	stats.RequestLatency.Merge(other.RequestLatency)
 	stats.RowsRead += other.RowsRead
 	stats.PollsDone += other.PollsDone
 	stats.IdlePolls += other.IdlePolls
@@ -249,13 +242,6 @@ func printFinalResults(stats *Stats) {
 	fmt.Printf("polls/s:        %f/s\n", float64(stats.PollsDone)/testDuration.Seconds())
 	fmt.Printf("idle polls:     %d/%d (%f%%)\n", stats.IdlePolls, stats.PollsDone, 100.0*float64(stats.IdlePolls)/float64(stats.PollsDone))
 	fmt.Printf("errors:         %d\n", stats.Errors)
-	fmt.Printf("latency min:    %f ms\n", float64(stats.RequestLatency.Min())/1000000.0)
-	fmt.Printf("latency avg:    %f ms\n", stats.RequestLatency.Mean()/1000000.0)
-	fmt.Printf("latency median: %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(50.0))/1000000.0)
-	fmt.Printf("latency 90%%:    %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(90.0))/1000000.0)
-	fmt.Printf("latency 99%%:    %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(99.0))/1000000.0)
-	fmt.Printf("latency 99.9%%:  %f ms\n", float64(stats.RequestLatency.ValueAtQuantile(99.9))/1000000.0)
-	fmt.Printf("latency max:    %f ms\n", float64(stats.RequestLatency.Max())/1000000.0)
 
 	if printPollSizeHistogram {
 		pollSizes := make([]int, 0, len(stats.PollSizeDistribution))
@@ -391,7 +377,6 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			default:
 			}
 
-			readStart := time.Now()
 			iter := query.Bind(stream, lastTimestamp, gocql.UUIDFromTime(time.Now().Add(-gracePeriod))).Iter()
 
 			rowCount := 0
@@ -430,16 +415,12 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 				}
 			}
 
-			readEnd := time.Now()
-
 			if err := iter.Close(); err != nil {
 				// Log error and continue to backoff logic
 				if verbose {
 					log.Println(err)
 				}
 				currentStats.Errors++
-			} else {
-				currentStats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
 			}
 			currentStats.PollsDone++
 			if printPollSizeHistogram {
