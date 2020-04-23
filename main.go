@@ -439,6 +439,9 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 				}
 				currentStats.Errors++
 			} else {
+				// Adjust for the sleeping time
+				latency := readEnd.Sub(readStart)
+				latency -= time.Duration(rowCount) * processingTimePerRow
 				currentStats.RequestLatency.RecordValue(readEnd.Sub(readStart).Nanoseconds())
 			}
 			currentStats.PollsDone++
