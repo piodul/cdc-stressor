@@ -236,7 +236,7 @@ func printPartialResults(stats *Stats, normalizationFactor float64) {
 }
 
 func printFinalResults(stats *Stats) {
-	fmt.Println("Results:")
+	fmt.Println("\nResults:")
 	fmt.Printf("num rows read:  %d\n", stats.RowsRead)
 	fmt.Printf("rows read/s:    %f/s\n", float64(stats.RowsRead)/testDuration.Seconds())
 	fmt.Printf("polls/s:        %f/s\n", float64(stats.PollsDone)/testDuration.Seconds())
@@ -250,7 +250,7 @@ func printFinalResults(stats *Stats) {
 		}
 		sort.Ints(pollSizes)
 
-		fmt.Println("poll size distribution:")
+		fmt.Println("\npoll size distribution:")
 		fmt.Println("  size   :   count")
 		for _, pollSize := range pollSizes {
 			fmt.Printf("  %-7d: %7d\n", pollSize, stats.PollSizeDistribution[pollSize])
