@@ -38,14 +38,24 @@ By default, cdc-stressor will try to connect to localhost and read from `scylla_
         queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps (default 100ms)
     -keyspace string
         keyspace name (default "scylla_bench")
+    -log-interval duration
+        how much time to wait between printing partial results (default 1s)
     -nodes string
         cluster nodes to connect to (default "127.0.0.1")
     -page-size int
         page size (default 1000)
+    -print-poll-size-histogram
+        enables printing poll size histogram at the end (default true)
+    -processing-batch-size uint
+        maximum count of rows to process in one batch; after each batch the goroutine will sleep some time proportional to the number of rows in batch
+    -processing-time-per-row duration
+        how much processing time one row adds to current batch (default 10ms)
     -table string
         name of the cdc table to read from (default "test_scylla_cdc_log")
     -timeout duration
         request timeout (default 5s)
+    -verbose
+        enables printing error message each time a read operation on cdc log table fails
     -worker-count int
         number of workers reading from the same table (default 1)
     -worker-id int
