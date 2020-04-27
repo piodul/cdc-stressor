@@ -117,13 +117,13 @@ func main() {
 	flag.BoolVar(&clientCompression, "client-compression", true, "use compression for client-coordinator communication")
 	flag.BoolVar(&bypassCache, "bypass-cache", true, "use BYPASS CACHE when querying the cdc log table")
 
-	flag.DurationVar(&backoffMinimum, "backoff-min", 10*time.Millisecond, "minimum time to wait on backoff")
-	flag.DurationVar(&backoffMaximum, "backoff-max", 500*time.Millisecond, "maximum time to wait on backoff")
+	flag.DurationVar(&backoffMinimum, "backoff-min", 1*time.Second, "minimum time to wait on backoff")
+	flag.DurationVar(&backoffMaximum, "backoff-max", 1*time.Second, "maximum time to wait on backoff")
 	flag.Float64Var(&backoffMultiplier, "backoff-multiplier", 2.0, "multiplier that increases the wait time for consecutive backoffs (must be > 1)")
 
 	flag.DurationVar(&gracePeriod, "grace-period", 100*time.Millisecond, "queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps")
 
-	flag.DurationVar(&processingTimePerRow, "processing-time-per-row", 10*time.Millisecond, "how much processing time one row adds to current batch")
+	flag.DurationVar(&processingTimePerRow, "processing-time-per-row", 0, "how much processing time one row adds to current batch")
 	flag.Uint64Var(&processingBatchSize, "processing-batch-size", 0, "maximum count of rows to process in one batch; after each batch the goroutine will sleep some time proportional to the number of rows in batch")
 
 	flag.IntVar(&workerID, "worker-id", 0, "id of this worker, used when running multiple instances of this tool; each instance should have a different id, and it must be in range [0..N-1], where N is the number of workers")
@@ -451,17 +451,18 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 
 			if rowCount == 0 {
 				currentStats.IdlePolls++
-				select {
-				case <-time.After(backoffTime):
-					backoffTime *= time.Duration(float64(backoffTime) * backoffMultiplier)
-					if backoffTime > backoffMaximum {
-						backoffTime = backoffMaximum
-					}
-				case <-stop:
-					return
-				}
 			} else {
 				backoffTime = backoffMinimum
+			}
+
+			select {
+			case <-time.After(backoffTime):
+				backoffTime *= time.Duration(float64(backoffTime) * backoffMultiplier)
+				if backoffTime > backoffMaximum {
+					backoffTime = backoffMaximum
+				}
+			case <-stop:
+				return
 			}
 
 			now := time.Now()
