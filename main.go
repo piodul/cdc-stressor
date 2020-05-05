@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/codahale/hdrhistogram"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/gocql/gocql"
 )
@@ -50,6 +52,8 @@ var (
 	// will be simulated by sleeping for processingBatchSize * processingTimePerRow.
 	processingTimePerRow time.Duration
 	processingBatchSize  uint64
+
+	maxConcurrentPolls int64
 
 	logInterval time.Duration
 
@@ -126,6 +130,8 @@ func main() {
 	flag.DurationVar(&processingTimePerRow, "processing-time-per-row", 0, "how much processing time one row adds to current batch")
 	flag.Uint64Var(&processingBatchSize, "processing-batch-size", 0, "maximum count of rows to process in one batch; after each batch the goroutine will sleep some time proportional to the number of rows in batch")
 
+	flag.Int64Var(&maxConcurrentPolls, "max-concurrent-polls", 500, "maximum number of polls happening at the same time")
+
 	flag.IntVar(&workerID, "worker-id", 0, "id of this worker, used when running multiple instances of this tool; each instance should have a different id, and it must be in range [0..N-1], where N is the number of workers")
 	flag.IntVar(&workerCount, "worker-count", 1, "number of workers reading from the same table")
 
@@ -157,6 +163,10 @@ func main() {
 
 	if processingBatchSize == 0 {
 		processingBatchSize = math.MaxInt64
+	}
+
+	if maxConcurrentPolls <= 0 {
+		log.Fatal("you must allow at least one concurrent poll to happen at the same time")
 	}
 
 	cluster := gocql.NewCluster(strings.Split(nodes, ",")...)
@@ -297,12 +307,13 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 		log.Fatal("There are no streams in the most recent generation, or there are no generations in cdc_description table")
 	}
 
+	concurrencySem := semaphore.NewWeighted(maxConcurrentPolls)
 	finished := make(chan struct{})
 
 	statsChans := make([]<-chan *Stats, 0)
 	for i := workerID; i < len(bestStreams); i += workerCount {
 		stream := bestStreams[i]
-		c := processStream(stop, session, stream, cdcLogTableName, startTimestamp)
+		c := processStream(stop, session, concurrencySem, stream, cdcLogTableName, startTimestamp)
 		statsChans = append(statsChans, c)
 	}
 	log.Printf("Watching changes from %d of %d total streams", len(statsChans), len(bestStreams))
@@ -356,7 +367,7 @@ func mergeFinalStats(result *Stats, statsChans []<-chan *Stats) *Stats {
 	return result
 }
 
-func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, cdcLogTableName string, timestamp time.Time) <-chan *Stats {
+func processStream(stop <-chan struct{}, session *gocql.Session, concurrencySem *semaphore.Weighted, stream Stream, cdcLogTableName string, timestamp time.Time) <-chan *Stats {
 	statsChan := make(chan *Stats, 1)
 
 	go func() {
@@ -384,11 +395,21 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 		)
 		query := session.Query(queryString)
 
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-stop
+			cancel()
+		}()
+
 		for {
 			select {
 			case <-stop:
 				return
 			default:
+			}
+
+			if err := concurrencySem.Acquire(ctx, 1); err != nil {
+				return
 			}
 
 			readStart := time.Now()
@@ -431,6 +452,7 @@ func processStream(stop <-chan struct{}, session *gocql.Session, stream Stream, 
 			}
 
 			readEnd := time.Now()
+			concurrencySem.Release(1)
 
 			if err := iter.Close(); err != nil {
 				// Log error and continue to backoff logic
