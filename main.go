@@ -36,9 +36,9 @@ var (
 	clientCompression bool
 	bypassCache       bool
 
-	backoffMinimum    time.Duration
-	backoffMaximum    time.Duration
-	backoffMultiplier float64
+	// Streams are queried in round-robin fashion. This parameter specifies the length
+	// of one full round (in one round, all streams are queried).
+	streamQueryRoundDuration time.Duration
 
 	// If client timestamps are used, it might result in rows with older timestamps
 	// than the last row to be inserted into a stream. If we just polled for rows
@@ -121,9 +121,7 @@ func main() {
 	flag.BoolVar(&clientCompression, "client-compression", true, "use compression for client-coordinator communication")
 	flag.BoolVar(&bypassCache, "bypass-cache", true, "use BYPASS CACHE when querying the cdc log table")
 
-	flag.DurationVar(&backoffMinimum, "backoff-min", 1*time.Second, "minimum time to wait on backoff")
-	flag.DurationVar(&backoffMaximum, "backoff-max", 1*time.Second, "maximum time to wait on backoff")
-	flag.Float64Var(&backoffMultiplier, "backoff-multiplier", 2.0, "multiplier that increases the wait time for consecutive backoffs (must be > 1)")
+	flag.DurationVar(&streamQueryRoundDuration, "stream-query-round-duration", 1*time.Second, "specifies the length of one full round of querying all streams")
 
 	flag.DurationVar(&gracePeriod, "grace-period", 100*time.Millisecond, "queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps")
 
@@ -143,14 +141,6 @@ func main() {
 
 	if !strings.HasSuffix(tableName, cdcTableSuffix) {
 		log.Fatalf("table name should have %s suffix", cdcTableSuffix)
-	}
-
-	if backoffMinimum > backoffMaximum {
-		log.Fatal("minimum backoff time must not be larget than maximum backoff time")
-	}
-
-	if backoffMultiplier <= 1.0 {
-		log.Fatal("backoff multiplier must be greater than 1")
 	}
 
 	if workerCount < 1 {
@@ -311,14 +301,47 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 	finished := make(chan struct{})
 
 	statsChans := make([]<-chan *Stats, 0)
+	canAdvanceChans := make([]chan struct{}, 0)
 	for i := workerID; i < len(bestStreams); i += workerCount {
 		stream := bestStreams[i]
-		c := processStream(stop, session, concurrencySem, stream, cdcLogTableName, startTimestamp)
+		canAdvanceChans = append(canAdvanceChans, make(chan struct{}, 1))
+		c := processStream(stop, canAdvanceChans[i], session, concurrencySem, stream, cdcLogTableName, startTimestamp)
 		statsChans = append(statsChans, c)
 	}
 	log.Printf("Watching changes from %d of %d total streams", len(statsChans), len(bestStreams))
 	fmt.Println("Time elapsed             Polls/s   Rows/s   Errors/s")
 
+	localWorkerCount := len(statsChans)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-stop
+		cancel()
+	}()
+
+	go func() {
+		interval := streamQueryRoundDuration / time.Duration(localWorkerCount)
+		currentWorkerID := 0
+
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			if err := concurrencySem.Acquire(ctx, 1); err != nil {
+				return
+			}
+
+			canAdvanceChans[currentWorkerID] <- struct{}{}
+
+			currentWorkerID = (currentWorkerID + 1) % localWorkerCount
+			time.Sleep(interval)
+		}
+	}()
+
+	// Stats collector
 	go func() {
 		previousTimeElapsed := time.Duration(0)
 		for {
@@ -367,12 +390,12 @@ func mergeFinalStats(result *Stats, statsChans []<-chan *Stats) *Stats {
 	return result
 }
 
-func processStream(stop <-chan struct{}, session *gocql.Session, concurrencySem *semaphore.Weighted, stream Stream, cdcLogTableName string, timestamp time.Time) <-chan *Stats {
+func processStream(stop <-chan struct{}, canAdvance <-chan struct{}, session *gocql.Session, concurrencySem *semaphore.Weighted, stream Stream, cdcLogTableName string, timestamp time.Time) <-chan *Stats {
 	statsChan := make(chan *Stats, 1)
 
 	go func() {
 		processStartTime := time.Now()
-		nextReportTime := processStartTime.Add(logInterval)
+		nextReportTime := processStartTime
 
 		finalStats := NewStats()
 		finalStats.Final = true
@@ -383,7 +406,6 @@ func processStream(stop <-chan struct{}, session *gocql.Session, concurrencySem 
 		}()
 
 		lastTimestamp := gocql.UUIDFromTime(timestamp)
-		backoffTime := backoffMinimum
 
 		bypassString := ""
 		if bypassCache {
@@ -395,20 +417,10 @@ func processStream(stop <-chan struct{}, session *gocql.Session, concurrencySem 
 		)
 		query := session.Query(queryString)
 
-		ctx, cancel := context.WithCancel(context.Background())
-		go func() {
-			<-stop
-			cancel()
-		}()
-
 		for {
 			select {
+			case <-canAdvance:
 			case <-stop:
-				return
-			default:
-			}
-
-			if err := concurrencySem.Acquire(ctx, 1); err != nil {
 				return
 			}
 
@@ -473,18 +485,6 @@ func processStream(stop <-chan struct{}, session *gocql.Session, concurrencySem 
 
 			if rowCount == 0 {
 				currentStats.IdlePolls++
-			} else {
-				backoffTime = backoffMinimum
-			}
-
-			select {
-			case <-time.After(backoffTime):
-				backoffTime *= time.Duration(float64(backoffTime) * backoffMultiplier)
-				if backoffTime > backoffMaximum {
-					backoffTime = backoffMaximum
-				}
-			case <-stop:
-				return
 			}
 
 			now := time.Now()
