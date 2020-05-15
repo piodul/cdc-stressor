@@ -40,6 +40,10 @@ var (
 	// of one full round (in one round, all streams are queried).
 	streamQueryRoundDuration time.Duration
 
+	// Allows for tracking streams in groups. If this value is more than 1, one goroutine
+	// tracks `groupSize` streams, and fetches data from all its streams using one query.
+	groupSize int
+
 	// If client timestamps are used, it might result in rows with older timestamps
 	// than the last row to be inserted into a stream. If we just polled for rows
 	// newer than the timestamp of the last received rows, it would cause some rows
@@ -123,6 +127,8 @@ func main() {
 
 	flag.DurationVar(&streamQueryRoundDuration, "stream-query-round-duration", 1*time.Second, "specifies the length of one full round of querying all streams")
 
+	flag.IntVar(&groupSize, "group-size", 1, "how many streams should one goroutine track at once")
+
 	flag.DurationVar(&gracePeriod, "grace-period", 1*time.Second, "queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps")
 
 	flag.DurationVar(&processingTimePerRow, "processing-time-per-row", 0, "how much processing time one row adds to current batch")
@@ -141,6 +147,10 @@ func main() {
 
 	if !strings.HasSuffix(tableName, cdcTableSuffix) {
 		log.Fatalf("table name should have %s suffix", cdcTableSuffix)
+	}
+
+	if groupSize <= 0 {
+		log.Fatal("group size must be positive")
 	}
 
 	if workerCount < 1 {
@@ -300,15 +310,32 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 	concurrencySem := semaphore.NewWeighted(maxConcurrentPolls)
 	finished := make(chan struct{})
 
+	// Split into groups
+	streamGroups := make([][]Stream, 0)
+	var currentGroup []Stream
+	for _, stream := range bestStreams {
+		currentGroup = append(currentGroup, stream)
+		if len(currentGroup) >= groupSize {
+			streamGroups = append(streamGroups, currentGroup)
+			currentGroup = nil
+		}
+	}
+	if len(currentGroup) > 0 {
+		streamGroups = append(streamGroups, currentGroup)
+		currentGroup = nil
+	}
+
 	statsChans := make([]<-chan *Stats, 0)
 	canAdvanceChans := make([]chan struct{}, 0)
-	for i := workerID; i < len(bestStreams); i += workerCount {
-		stream := bestStreams[i]
+	trackedStreamsCount := 0
+	for i := workerID; i < len(streamGroups); i += workerCount {
+		streams := streamGroups[i]
+		trackedStreamsCount += len(streams)
 		canAdvanceChans = append(canAdvanceChans, make(chan struct{}, 1))
-		c := processStream(stop, canAdvanceChans[i], session, concurrencySem, stream, cdcLogTableName, startTimestamp)
+		c := processStreams(stop, canAdvanceChans[i], session, concurrencySem, streams, cdcLogTableName, startTimestamp)
 		statsChans = append(statsChans, c)
 	}
-	log.Printf("Watching changes from %d of %d total streams", len(statsChans), len(bestStreams))
+	log.Printf("Watching changes from %d stream groups (%d streams of %d total)", len(statsChans), trackedStreamsCount, len(bestStreams))
 	fmt.Println("Time elapsed             Polls/s   Rows/s   Errors/s")
 
 	localWorkerCount := len(statsChans)
@@ -390,7 +417,7 @@ func mergeFinalStats(result *Stats, statsChans []<-chan *Stats) *Stats {
 	return result
 }
 
-func processStream(stop <-chan struct{}, canAdvance <-chan struct{}, session *gocql.Session, concurrencySem *semaphore.Weighted, stream Stream, cdcLogTableName string, timestamp time.Time) <-chan *Stats {
+func processStreams(stop <-chan struct{}, canAdvance <-chan struct{}, session *gocql.Session, concurrencySem *semaphore.Weighted, streams []Stream, cdcLogTableName string, timestamp time.Time) <-chan *Stats {
 	statsChan := make(chan *Stats, 1)
 
 	go func() {
@@ -412,8 +439,10 @@ func processStream(stop <-chan struct{}, canAdvance <-chan struct{}, session *go
 			bypassString = " BYPASS CACHE"
 		}
 		queryString := fmt.Sprintf(
-			"SELECT * FROM %s WHERE \"cdc$stream_id\" = ? AND \"cdc$time\" > ? AND \"cdc$time\" < ?%s",
-			cdcLogTableName, bypassString,
+			"SELECT * FROM %s WHERE \"cdc$stream_id\" IN (%s) AND \"cdc$time\" > ? AND \"cdc$time\" < ?%s",
+			cdcLogTableName,
+			"?"+strings.Repeat(", ?", len(streams)-1),
+			bypassString,
 		)
 		query := session.Query(queryString)
 
@@ -425,7 +454,12 @@ func processStream(stop <-chan struct{}, canAdvance <-chan struct{}, session *go
 			}
 
 			readStart := time.Now()
-			iter := query.Bind(stream, lastTimestamp, gocql.UUIDFromTime(time.Now().Add(-gracePeriod))).Iter()
+			bindArgs := make([]interface{}, 0, len(streams)+2)
+			for _, stream := range streams {
+				bindArgs = append(bindArgs, stream)
+			}
+			bindArgs = append(bindArgs, lastTimestamp, gocql.UUIDFromTime(time.Now().Add(-gracePeriod)))
+			iter := query.Bind(bindArgs...).Iter()
 
 			rowCount := 0
 			batchRowCount := uint64(0)
