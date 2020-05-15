@@ -29,7 +29,7 @@ By default, cdc-stressor will try to connect to localhost and read from `scylla_
     -duration duration
         test duration, value <= 0 makes the test run infinitely until stopped
     -grace-period duration
-        queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps (default 100ms)
+        queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps (default 1s)
     -keyspace string
         keyspace name (default "scylla_bench")
     -log-interval duration

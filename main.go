@@ -123,7 +123,7 @@ func main() {
 
 	flag.DurationVar(&streamQueryRoundDuration, "stream-query-round-duration", 1*time.Second, "specifies the length of one full round of querying all streams")
 
-	flag.DurationVar(&gracePeriod, "grace-period", 100*time.Millisecond, "queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps")
+	flag.DurationVar(&gracePeriod, "grace-period", 1*time.Second, "queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps")
 
 	flag.DurationVar(&processingTimePerRow, "processing-time-per-row", 0, "how much processing time one row adds to current batch")
 	flag.Uint64Var(&processingBatchSize, "processing-batch-size", 0, "maximum count of rows to process in one batch; after each batch the goroutine will sleep some time proportional to the number of rows in batch")
