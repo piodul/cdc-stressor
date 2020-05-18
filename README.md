@@ -18,6 +18,10 @@ This tool fetches all columns from the CDC log table, but ignores all columns ap
 
 By default, cdc-stressor will try to connect to localhost and read from `scylla_bench.test_scylla_cdc_log` indefinitely. You can override the defaults with commandline options, full listing is presented below:
 
+    -backoff-max duration
+        (deprecated) polling method has changed, please use stream-query-round-duration instead (default 1s)
+    -backoff-min duration
+        (deprecated) polling method has changed, please use stream-query-round-duration instead (default 1s)
     -bypass-cache
         use BYPASS CACHE when querying the cdc log table (default true)
     -client-compression
@@ -30,6 +34,8 @@ By default, cdc-stressor will try to connect to localhost and read from `scylla_
         test duration, value <= 0 makes the test run infinitely until stopped
     -grace-period duration
         queries only for log writes older than (now - grace-period), helps mitigate issues with client timestamps (default 1s)
+    -group-size int
+        how many streams should one goroutine track at once (default 1)
     -keyspace string
         keyspace name (default "scylla_bench")
     -log-interval duration
