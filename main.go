@@ -113,6 +113,19 @@ func (stats *Stats) Merge(other *Stats) {
 
 type Stream []byte
 
+func getFlagToParsedStateMap() map[string]bool {
+	parsedFlags := make(map[string]bool)
+	// Visit all flags and set to false
+	flag.VisitAll(func(f *flag.Flag) {
+		parsedFlags[f.Name] = false
+	})
+	// Visit only parsed flags and set to true
+	flag.Visit(func(f *flag.Flag) {
+		parsedFlags[f.Name] = true
+	})
+	return parsedFlags
+}
+
 func main() {
 	flag.IntVar(&numConns, "connection-count", 4, "number of connections")
 	flag.StringVar(&keyspaceName, "keyspace", "scylla_bench", "keyspace name")
@@ -143,7 +156,19 @@ func main() {
 	flag.BoolVar(&verbose, "verbose", false, "enables printing error message each time a read operation on cdc log table fails")
 	flag.BoolVar(&printPollSizeHistogram, "print-poll-size-histogram", true, "enables printing poll size histogram at the end")
 
+	// Deprecated options
+	backoffMinDeprecated := flag.Duration("backoff-min", time.Second, "(deprecated) polling method has changed, please use stream-query-round-duration instead")
+	backoffMaxDeprecated := flag.Duration("backoff-max", time.Second, "(deprecated) polling method has changed, please use stream-query-round-duration instead")
+
 	flag.Parse()
+
+	flagWasParsed := getFlagToParsedStateMap()
+
+	if !flagWasParsed["stream-query-round-duration"] {
+		if flagWasParsed["backoff-min"] || flagWasParsed["backoff-max"] {
+			streamQueryRoundDuration = (*backoffMinDeprecated + *backoffMaxDeprecated) / time.Duration(2)
+		}
+	}
 
 	if !strings.HasSuffix(tableName, cdcTableSuffix) {
 		log.Fatalf("table name should have %s suffix", cdcTableSuffix)
