@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -514,7 +515,9 @@ func processStreams(stop <-chan struct{}, canAdvance <-chan struct{}, session *g
 				batchRowCount++
 
 				currentStats.RowsRead++
-				lastTimestamp = timestamp
+				if bytes.Compare(lastTimestamp[:], timestamp[:]) < 0 {
+					lastTimestamp = timestamp
+				}
 
 				if batchRowCount == processingBatchSize {
 					if doStop := sleepForBatch(); doStop {
