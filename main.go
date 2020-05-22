@@ -356,8 +356,9 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 	for i := workerID; i < len(streamGroups); i += workerCount {
 		streams := streamGroups[i]
 		trackedStreamsCount += len(streams)
-		canAdvanceChans = append(canAdvanceChans, make(chan struct{}, 1))
-		c := processStreams(stop, canAdvanceChans[i], session, concurrencySem, streams, cdcLogTableName, startTimestamp)
+		workerAdvanceChan := make(chan struct{}, 1)
+		canAdvanceChans = append(canAdvanceChans, workerAdvanceChan)
+		c := processStreams(stop, workerAdvanceChan, session, concurrencySem, streams, cdcLogTableName, startTimestamp)
 		statsChans = append(statsChans, c)
 	}
 	log.Printf("Watching changes from %d stream groups (%d streams of %d total)", len(statsChans), trackedStreamsCount, len(bestStreams))
