@@ -25,6 +25,15 @@ const (
 )
 
 var (
+	// The table that keeps names of the generations changed names.
+	// This is a list of all supported names, starting from the newest one.
+	generationsTableNames []string = []string{
+		"system_distributed.cdc_streams", // Introduced in Scylla 4.1
+		"system_distributed.cdc_description",
+	}
+)
+
+var (
 	numConns     int
 	keyspaceName string
 	tableName    string
@@ -308,12 +317,36 @@ func printFinalResults(stats *Stats) {
 	}
 }
 
+func getGenerationsTableName(session *gocql.Session) string {
+	for _, name := range generationsTableNames {
+		splitName := strings.Split(name, ".")
+		keyspaceName := splitName[0]
+		tableName := splitName[1]
+
+		iter := session.Query(fmt.Sprintf("SELECT COUNT(*) FROM system_schema.tables WHERE keyspace_name = '%s' AND table_name = '%s'", keyspaceName, tableName)).Iter()
+		var count int
+		iter.Scan(&count)
+
+		if err := iter.Close(); err != nil {
+			fmt.Printf("%#v\n", err)
+			log.Fatal(err)
+		}
+
+		if count == 1 {
+			return name
+		}
+	}
+
+	log.Fatal("there is no table to read cdc generations from")
+	return ""
+}
+
 func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName string) <-chan struct{} {
 	// Account for grace period, so that we won't poll unnecessarily in the beginning
 	startTimestamp := time.Now().Add(-gracePeriod)
 
 	// Choose the most recent generation
-	iter := session.Query("SELECT time, expired, streams FROM system_distributed.cdc_description BYPASS CACHE").Iter()
+	iter := session.Query(fmt.Sprintf("SELECT time, expired, streams FROM %s BYPASS CACHE", getGenerationsTableName(session))).Iter()
 
 	var timestamp, bestTimestamp, expired time.Time
 	var streams, bestStreams []Stream
