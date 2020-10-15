@@ -505,6 +505,7 @@ func processStreams(stop <-chan struct{}, canAdvance <-chan struct{}, session *g
 			"?"+strings.Repeat(", ?", len(streams)-1),
 			bypassString,
 		)
+		fmt.Printf("Performing query: %s\n", queryString)
 		query := session.Query(queryString)
 
 		for {
