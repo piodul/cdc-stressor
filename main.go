@@ -505,7 +505,6 @@ func processStreams(stop <-chan struct{}, canAdvance <-chan struct{}, session *g
 			"?"+strings.Repeat(", ?", len(streams)-1),
 			bypassString,
 		)
-		fmt.Printf("Performing query: %s\n", queryString)
 		query := session.Query(queryString)
 
 		for {
@@ -521,6 +520,7 @@ func processStreams(stop <-chan struct{}, canAdvance <-chan struct{}, session *g
 				bindArgs = append(bindArgs, stream)
 			}
 			bindArgs = append(bindArgs, lastTimestamp, gocql.UUIDFromTime(time.Now().Add(-gracePeriod)))
+			fmt.Printf("Args: %v\n", bindArgs)
 			iter := query.Bind(bindArgs...).Iter()
 
 			rowCount := 0
