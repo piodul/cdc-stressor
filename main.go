@@ -317,21 +317,7 @@ func printFinalResults(stats *Stats) {
 	}
 }
 
-func getGenerationsTableName(session *gocql.Session) string {
-	for _, name := range generationsTableNames {
-		if isTableInSchema(session, name) {
-			return name
-		}
-	}
-
-	log.Fatal("there is no table to read cdc generations from")
-	return ""
-}
-
-func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName string) <-chan struct{} {
-	// Account for grace period, so that we won't poll unnecessarily in the beginning
-	startTimestamp := time.Now().Add(-gracePeriod)
-
+func getCurrentGeneration(session *gocql.Session) []Stream {
 	// Choose the most recent generation
 	iter := session.Query(fmt.Sprintf("SELECT time, expired, streams FROM %s BYPASS CACHE", getGenerationsTableName(session))).Iter()
 
@@ -353,13 +339,14 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 		log.Fatal("There are no streams in the most recent generation, or there are no generations in cdc_description table")
 	}
 
-	concurrencySem := semaphore.NewWeighted(maxConcurrentPolls)
-	finished := make(chan struct{})
+	return bestStreams
+}
 
+func splitStreamsByConfiguredGroupSize(gen []Stream) [][]Stream {
 	// Split into groups
 	streamGroups := make([][]Stream, 0)
 	var currentGroup []Stream
-	for _, stream := range bestStreams {
+	for _, stream := range gen {
 		currentGroup = append(currentGroup, stream)
 		if len(currentGroup) >= groupSize {
 			streamGroups = append(streamGroups, currentGroup)
@@ -370,6 +357,30 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 		streamGroups = append(streamGroups, currentGroup)
 		currentGroup = nil
 	}
+
+	return streamGroups
+}
+
+func getGenerationsTableName(session *gocql.Session) string {
+	for _, name := range generationsTableNames {
+		if isTableInSchema(session, name) {
+			return name
+		}
+	}
+
+	log.Fatal("there is no table to read cdc generations from")
+	return ""
+}
+
+func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName string) <-chan struct{} {
+	// Account for grace period, so that we won't poll unnecessarily in the beginning
+	startTimestamp := time.Now().Add(-gracePeriod)
+
+	generation := getCurrentGeneration(session)
+	streamGroups := splitStreamsByConfiguredGroupSize(generation)
+
+	concurrencySem := semaphore.NewWeighted(maxConcurrentPolls)
+	finished := make(chan struct{})
 
 	statsChans := make([]<-chan *Stats, 0)
 	canAdvanceChans := make([]chan struct{}, 0)
@@ -382,7 +393,7 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 		c := processStreams(stop, workerAdvanceChan, session, concurrencySem, streams, cdcLogTableName, startTimestamp)
 		statsChans = append(statsChans, c)
 	}
-	log.Printf("Watching changes from %d stream groups (%d streams of %d total)", len(statsChans), trackedStreamsCount, len(bestStreams))
+	log.Printf("Watching changes from %d stream groups (%d streams of %d total)", len(statsChans), trackedStreamsCount, len(generation))
 	fmt.Println("Time elapsed             Polls/s   Rows/s   Errors/s")
 
 	localWorkerCount := len(statsChans)
