@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -342,6 +343,43 @@ func getCurrentGeneration(session *gocql.Session) []Stream {
 	return bestStreams
 }
 
+func splitStreamsByVnodeIndex(streams []Stream) [][]Stream {
+	vnodesIdxToStreams := make(map[int64][]Stream)
+	for _, stream := range streams {
+		idx := getVnodeIndexForStream(stream)
+		vnodesIdxToStreams[idx] = append(vnodesIdxToStreams[idx], stream)
+	}
+
+	// Idx -1 means that we don't know the vnode for given stream.
+	// We will group them using the configured group size.
+	groups := splitStreamsByConfiguredGroupSize(vnodesIdxToStreams[-1])
+	delete(vnodesIdxToStreams, -1)
+
+	for _, group := range vnodesIdxToStreams {
+		groups = append(groups, group)
+	}
+	return groups
+}
+
+// Computes vnode index from given stream ID.
+// Returns -1 if the stream ID format is unrecognized.
+func getVnodeIndexForStream(stream Stream) int64 {
+	if len(stream) != 16 {
+		// Don't know how to handle other sizes
+		return -1
+	}
+
+	lowerQword := binary.BigEndian.Uint64(stream[8:16])
+	version := lowerQword & (1<<4 - 1)
+	if version != 1 {
+		// Unrecognized version
+		return -1
+	}
+
+	vnodeIdx := (lowerQword >> 4) & (1<<22 - 1)
+	return int64(vnodeIdx)
+}
+
 func splitStreamsByConfiguredGroupSize(gen []Stream) [][]Stream {
 	// Split into groups
 	streamGroups := make([][]Stream, 0)
@@ -377,7 +415,7 @@ func ReadCdcLog(stop <-chan struct{}, session *gocql.Session, cdcLogTableName st
 	startTimestamp := time.Now().Add(-gracePeriod)
 
 	generation := getCurrentGeneration(session)
-	streamGroups := splitStreamsByConfiguredGroupSize(generation)
+	streamGroups := splitStreamsByVnodeIndex(generation)
 
 	concurrencySem := semaphore.NewWeighted(maxConcurrentPolls)
 	finished := make(chan struct{})
