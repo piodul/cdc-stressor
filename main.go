@@ -319,20 +319,7 @@ func printFinalResults(stats *Stats) {
 
 func getGenerationsTableName(session *gocql.Session) string {
 	for _, name := range generationsTableNames {
-		splitName := strings.Split(name, ".")
-		keyspaceName := splitName[0]
-		tableName := splitName[1]
-
-		iter := session.Query(fmt.Sprintf("SELECT COUNT(*) FROM system_schema.tables WHERE keyspace_name = '%s' AND table_name = '%s'", keyspaceName, tableName)).Iter()
-		var count int
-		iter.Scan(&count)
-
-		if err := iter.Close(); err != nil {
-			fmt.Printf("%#v\n", err)
-			log.Fatal(err)
-		}
-
-		if count == 1 {
+		if isTableInSchema(session, name) {
 			return name
 		}
 	}
@@ -596,6 +583,29 @@ func processStreams(stop <-chan struct{}, canAdvance <-chan struct{}, session *g
 	}()
 
 	return statsChan
+}
+
+// Takes a fully-qualified name of a table and returns if a table of given name
+// is in the schema.
+// Panics if the table name is not qualified, i.e. it does not contain a dot.
+func isTableInSchema(session *gocql.Session, tableName string) bool {
+	decomposed := strings.SplitN(tableName, ".", 2)
+	if len(decomposed) < 2 {
+		panic("unqualified table name passed to isTableInSchema")
+	}
+
+	keyspace := decomposed[0]
+	table := decomposed[1]
+
+	meta, err := session.KeyspaceMetadata(keyspace)
+	if err == gocql.ErrKeyspaceDoesNotExist {
+		return false
+	} else if err != nil {
+		log.Fatal(err)
+	}
+
+	_, ok := meta.Tables[table]
+	return ok
 }
 
 func compareTimeuuid(u1 gocql.UUID, u2 gocql.UUID) int {
