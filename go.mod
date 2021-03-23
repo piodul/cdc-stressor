@@ -9,4 +9,4 @@ require (
 	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
 )
 
-replace github.com/gocql/gocql => github.com/scylladb/gocql v1.3.4
+replace github.com/gocql/gocql => github.com/scylladb/gocql v1.5.0
