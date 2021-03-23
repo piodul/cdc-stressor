@@ -25,9 +25,14 @@ const (
 )
 
 var (
+	// In Scylla 4.4, two tables are used for storing information
+	// about generations.
+	timestampsTableSince4_4 = "system_distributed.cdc_generation_timestamps"
+	streamsTableSince4_4    = "system_distributed.cdc_streams_descriptions_v2"
+
 	// The table that keeps names of the generations changed names.
 	// This is a list of all supported names, starting from the newest one.
-	generationsTableNames []string = []string{
+	generationsTableNamesPre4_4 []string = []string{
 		"system_distributed.cdc_streams_descriptions", // Introduced in Scylla 4.3
 		"system_distributed.cdc_streams",              // Introduced in Scylla 4.1
 		"system_distributed.cdc_description",
@@ -319,8 +324,44 @@ func printFinalResults(stats *Stats) {
 }
 
 func getCurrentGeneration(session *gocql.Session) []Stream {
+	if isTableInSchema(session, streamsTableSince4_4) {
+		return getCurrentGenerationSince4_4(session)
+	}
+	return getCurrentGenerationPre4_4(session)
+}
+
+func getCurrentGenerationSince4_4(session *gocql.Session) []Stream {
+	// Get the latest timestamp
+	iter := session.Query(fmt.Sprintf("SELECT time FROM %s WHERE key = 'timestamps'", timestampsTableSince4_4)).Iter()
+	var (
+		bestTime time.Time
+		currTime time.Time
+	)
+	for iter.Scan(&currTime) {
+		if bestTime.Before(currTime) {
+			bestTime = currTime
+		}
+	}
+	if err := iter.Close(); err != nil {
+		log.Fatal(err)
+	}
+
+	// Get the latest generation
+	iter = session.Query(fmt.Sprintf("SELECT streams FROM %s WHERE time = ?", streamsTableSince4_4), bestTime).Iter()
+	var allStreams, currStreams []Stream
+	for iter.Scan(&currStreams) {
+		allStreams = append(allStreams, currStreams...)
+	}
+	if err := iter.Close(); err != nil {
+		log.Fatal(err)
+	}
+
+	return allStreams
+}
+
+func getCurrentGenerationPre4_4(session *gocql.Session) []Stream {
 	// Choose the most recent generation
-	iter := session.Query(fmt.Sprintf("SELECT time, expired, streams FROM %s BYPASS CACHE", getGenerationsTableName(session))).Iter()
+	iter := session.Query(fmt.Sprintf("SELECT time, expired, streams FROM %s BYPASS CACHE", getPre4_4GenerationsTableName(session))).Iter()
 
 	var timestamp, bestTimestamp, expired time.Time
 	var streams, bestStreams []Stream
@@ -399,8 +440,8 @@ func splitStreamsByConfiguredGroupSize(gen []Stream) [][]Stream {
 	return streamGroups
 }
 
-func getGenerationsTableName(session *gocql.Session) string {
-	for _, name := range generationsTableNames {
+func getPre4_4GenerationsTableName(session *gocql.Session) string {
+	for _, name := range generationsTableNamesPre4_4 {
 		if isTableInSchema(session, name) {
 			return name
 		}
