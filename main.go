@@ -325,7 +325,21 @@ func printFinalResults(stats *Stats) {
 
 func getCurrentGeneration(session *gocql.Session) []Stream {
 	if isTableInSchema(session, streamsTableSince4_4) {
-		return getCurrentGenerationSince4_4(session)
+		// Check if generations were rewriten
+		data := make(map[string]interface{})
+		err := session.Query("SELECT streams_timestamp FROM system.cdc_local WHERE key = 'rewritten'").
+			MapScan(data)
+
+		if err == gocql.ErrNotFound {
+			// The "rewritten" row is not present yet, this means that the generations
+			// weren't rewritten yet
+			// We will use the old generations table
+			return getCurrentGenerationPre4_4(session)
+		} else if err != nil {
+			log.Fatal(err)
+		} else {
+			return getCurrentGenerationSince4_4(session)
+		}
 	}
 	return getCurrentGenerationPre4_4(session)
 }
