@@ -82,6 +82,8 @@ var (
 
 	verbose                bool
 	printPollSizeHistogram bool
+	username               string
+	password               string
 )
 
 type Stats struct {
@@ -172,6 +174,9 @@ func main() {
 	flag.BoolVar(&verbose, "verbose", false, "enables printing error message each time a read operation on cdc log table fails")
 	flag.BoolVar(&printPollSizeHistogram, "print-poll-size-histogram", true, "enables printing poll size histogram at the end")
 
+	flag.StringVar(&username, "username", "", "Username for cluster")
+	flag.StringVar(&password, "password", "", "Password for cluster")
+
 	// Deprecated options
 	backoffMinDeprecated := flag.Duration("backoff-min", time.Second, "(deprecated) polling method has changed, please use stream-query-round-duration instead")
 	backoffMaxDeprecated := flag.Duration("backoff-max", time.Second, "(deprecated) polling method has changed, please use stream-query-round-duration instead")
@@ -211,6 +216,14 @@ func main() {
 	}
 
 	cluster := gocql.NewCluster(strings.Split(nodes, ",")...)
+
+	if username != "" && password != "" {
+		cluster.Authenticator = gocql.PasswordAuthenticator{
+			Username: username,
+			Password: password,
+		}
+	}
+
 	cluster.NumConns = numConns
 	cluster.PageSize = pageSize
 	cluster.Compressor = &gocql.SnappyCompressor{}
